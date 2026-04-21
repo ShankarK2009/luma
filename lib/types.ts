@@ -122,6 +122,12 @@ export interface WeatherSnapshot {
   forecastDate: string;
   temperatureHighC: number;
   temperatureLowC: number;
+  currentTempC?: number;
+  apparentTempC?: number;
+  windSpeedKph?: number;
+  uvIndexMax?: number;
+  sunrise?: string;
+  sunset?: string;
   precipitationProbability: number;
   conditionCode: string;
   raw: Record<string, unknown>;

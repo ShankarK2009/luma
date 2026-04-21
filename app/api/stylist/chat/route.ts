@@ -43,6 +43,7 @@ export async function POST(request: Request) {
       listRecentFeedback(user.userId),
     ]);
     const weather = await getWeatherSnapshot(person);
+    const itemsById = new Map(wardrobe.map((item) => [item.id, item]));
 
     const result = await runStylistAssistant({
       message: payload.message,
@@ -72,6 +73,8 @@ export async function POST(request: Request) {
               name: item.name,
               category: item.category,
               colors: item.colors,
+              styleTags: item.styleTags,
+              occasionTags: item.occasionTags,
             }));
 
           return { matches };
@@ -85,8 +88,33 @@ export async function POST(request: Request) {
             vibePrompt: String(args.vibePrompt ?? ""),
           });
 
+          const primaryItems = [
+            outfit.outfit.primarySlots.top,
+            outfit.outfit.primarySlots.bottom,
+            outfit.outfit.primarySlots.onePiece,
+            outfit.outfit.primarySlots.outerwear,
+            outfit.outfit.primarySlots.shoes,
+            ...(outfit.outfit.primarySlots.accessories ?? []),
+          ]
+            .filter(Boolean)
+            .map((itemId) => {
+              const item = itemsById.get(String(itemId));
+              return item
+                ? {
+                    id: item.id,
+                    name: item.name,
+                    category: item.category,
+                    colors: item.colors,
+                  }
+                : {
+                    id: String(itemId),
+                  };
+            });
+
           return {
             outfit: outfit.outfit,
+            primaryItems,
+            reasoning: outfit.outfit.reasoning,
           };
         },
         savePreference: async (args) => {

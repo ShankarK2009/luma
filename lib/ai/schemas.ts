@@ -75,6 +75,7 @@ export const styleProfileUpdateSchema = z.object({
 export const outfitGenerateRequestSchema = z.object({
   vibePrompt: z.string().optional(),
   date: z.string().optional(),
+  excludeSlotKeys: z.array(z.string()).default([]),
 });
 
 export const feedbackRequestSchema = z.object({

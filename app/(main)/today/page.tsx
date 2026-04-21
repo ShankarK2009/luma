@@ -1,23 +1,32 @@
 import { CloudSun, Sparkles, Thermometer } from "lucide-react";
 
+import { TodayGenerateButton } from "@/components/today-generate-button";
 import { SectionCard } from "@/components/section-card";
 import { TodayOutfitCard } from "@/components/today-outfit-card";
 import { getCurrentUserContext } from "@/lib/auth/session";
-import { getStyleProfile, getTodayOutfit, listWardrobeItems } from "@/lib/data/repository";
+import {
+  canGenerateOutfitFromItems,
+  getStyleProfile,
+  getTodayOutfit,
+  getUserProfile,
+  listWardrobeItems,
+} from "@/lib/data/repository";
 import { generateOutfitForUser } from "@/lib/outfits/generate";
 import { getWeatherSnapshot } from "@/lib/weather/open-meteo";
 import { formatTemperature } from "@/lib/utils";
 
 export default async function TodayPage() {
   const user = await getCurrentUserContext();
-  const [items, styleProfile, savedOutfit, weather] = await Promise.all([
+  const [items, styleProfile, savedOutfit, profile] = await Promise.all([
     listWardrobeItems(user.userId),
     getStyleProfile(user.userId),
     getTodayOutfit(user.userId),
-    getWeatherSnapshot(),
+    getUserProfile(user.userId),
   ]);
+  const weather = await getWeatherSnapshot(profile);
+  const generationState = canGenerateOutfitFromItems(items);
   const generated =
-    !savedOutfit && items.length > 0
+    !savedOutfit && generationState.canGenerate
       ? await generateOutfitForUser({
           userId: user.userId,
         }).catch(() => null)
@@ -55,6 +64,30 @@ export default async function TodayPage() {
               {weather.precipitationProbability}% chance of precipitation
             </p>
           </div>
+          <div className="rounded-[1.5rem] border border-white/10 bg-black/10 p-4">
+            <div className="flex items-center gap-2 text-[var(--text-soft)]">
+              <Thermometer className="h-4 w-4" />
+              Feels like
+            </div>
+            <p className="mt-3 text-lg font-semibold text-[var(--text-strong)]">
+              {formatTemperature(weather.apparentTempC ?? weather.currentTempC ?? weather.temperatureLowC)}
+            </p>
+            <p className="mt-1 text-sm text-[var(--text-soft)]">
+              Current {formatTemperature(weather.currentTempC ?? weather.temperatureLowC)}
+            </p>
+          </div>
+          <div className="rounded-[1.5rem] border border-white/10 bg-black/10 p-4">
+            <div className="flex items-center gap-2 text-[var(--text-soft)]">
+              <CloudSun className="h-4 w-4" />
+              Wind and UV
+            </div>
+            <p className="mt-3 text-lg font-semibold text-[var(--text-strong)]">
+              {Math.round(weather.windSpeedKph ?? 0)} km/h
+            </p>
+            <p className="mt-1 text-sm text-[var(--text-soft)]">
+              UV max {weather.uvIndexMax ?? "n/a"}
+            </p>
+          </div>
         </div>
       </SectionCard>
 
@@ -63,12 +96,32 @@ export default async function TodayPage() {
       ) : (
         <SectionCard
           eyebrow="Outfits"
-          title="Generate your first look"
-          description="Add a few wardrobe items first, then Luma can build a weather-aware outfit with alternates."
+          title={
+            generationState.canGenerate
+              ? "Generate today's look"
+              : "Almost ready to generate"
+          }
+          description={
+            generationState.canGenerate
+              ? "You have enough wardrobe coverage to generate a fresh weather-aware outfit."
+              : "Luma needs either a top, bottom, and shoes, or a one-piece and shoes."
+          }
         >
-          <p className="text-sm leading-6 text-[var(--text-soft)]">
-            Capture at least a top, a bottom or one-piece, and shoes to unlock the full outfit engine.
-          </p>
+          {generationState.canGenerate ? (
+            <TodayGenerateButton />
+          ) : (
+            <p className="text-sm leading-6 text-[var(--text-soft)]">
+              Missing pieces:
+              {" "}
+              {[
+                !generationState.needs.top && !generationState.needs.onePiece ? "top or one-piece" : null,
+                !generationState.needs.bottom && !generationState.needs.onePiece ? "bottom" : null,
+                !generationState.needs.shoes ? "shoes" : null,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            </p>
+          )}
         </SectionCard>
       )}
 

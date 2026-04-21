@@ -4,6 +4,7 @@ import { useState } from "react";
 import { LoaderCircle, Send } from "lucide-react";
 
 import type { StylistMessage } from "@/lib/types";
+import { titleCase } from "@/lib/utils";
 
 async function readErrorMessage(response: Response) {
   try {
@@ -25,6 +26,43 @@ export function StylistChat({
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [activeThreadId, setActiveThreadId] = useState(threadId);
+
+  const getOutfitItemsFromMessage = (message: StylistMessage) => {
+    const generateOutfitCall = message.toolCalls.find(
+      (call) => call.name === "generateOutfit",
+    );
+
+    if (
+      !generateOutfitCall ||
+      typeof generateOutfitCall.result !== "object" ||
+      !generateOutfitCall.result ||
+      !("primaryItems" in generateOutfitCall.result)
+    ) {
+      return [];
+    }
+
+    const rawItems = (generateOutfitCall.result as { primaryItems?: unknown }).primaryItems;
+    if (!Array.isArray(rawItems)) {
+      return [];
+    }
+
+    return rawItems
+      .filter((entry) => typeof entry === "object" && entry !== null)
+      .map((entry) => {
+        const item = entry as {
+          id?: string;
+          name?: string;
+          category?: string;
+          colors?: string[];
+        };
+        return {
+          id: item.id ?? crypto.randomUUID(),
+          name: item.name ?? "Wardrobe item",
+          category: item.category ?? "item",
+          colors: Array.isArray(item.colors) ? item.colors : [],
+        };
+      });
+  };
 
   const handleSubmit = async () => {
     if (!draft.trim()) return;
@@ -98,6 +136,42 @@ export function StylistChat({
             }`}
           >
             {message.content}
+            {message.role === "assistant" ? (
+              (() => {
+                const outfitItems = getOutfitItemsFromMessage(message);
+                if (!outfitItems.length) {
+                  return null;
+                }
+
+                return (
+                  <div className="mt-3 grid gap-2">
+                    {outfitItems.map((item) => (
+                      <article
+                        key={item.id}
+                        className="rounded-2xl border border-white/15 bg-black/15 p-3"
+                      >
+                        <p className="text-sm font-semibold text-[var(--text-strong)]">{item.name}</p>
+                        <p className="text-[0.68rem] uppercase tracking-[0.2em] text-[var(--text-soft)]">
+                          {titleCase(item.category)}
+                        </p>
+                        {item.colors.length ? (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {item.colors.slice(0, 3).map((color) => (
+                              <span
+                                key={`${item.id}-${color}`}
+                                className="rounded-full border border-white/10 px-2 py-0.5 text-[0.65rem] uppercase tracking-[0.16em] text-[var(--text-soft)]"
+                              >
+                                {color}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </article>
+                    ))}
+                  </div>
+                );
+              })()
+            ) : null}
           </div>
         ))}
 

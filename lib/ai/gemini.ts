@@ -134,6 +134,180 @@ function guessCategory(fileName: string) {
   };
 }
 
+function buildFallbackStyleSummary(params: {
+  freeformPreferences: string;
+  explicitLikes?: string[];
+  explicitDislikes?: string[];
+}) {
+  return styleSummarySchema.parse({
+    summary: params.freeformPreferences,
+    preferred_colors: params.explicitLikes?.filter((entry) => entry.length < 20) ?? [
+      "navy",
+      "white",
+      "charcoal",
+    ],
+    avoided_colors: params.explicitDislikes ?? [],
+    preferred_silhouettes: ["tailored", "easy layer"],
+    favorite_categories: ["shirt", "trousers", "outerwear"],
+    target_vibes: ["confident", "clean"],
+    formality_tendency: "balanced",
+    notes: ["Fallback summary used because Gemini was unavailable."],
+  });
+}
+
+function buildFallbackOutfitRanking(candidates: CandidateOutfit[]) {
+  return outfitRankingSchema.parse({
+    primary_candidate_id: candidates[0]?.id ?? "",
+    alternate_candidate_ids: candidates.slice(1, 3).map((entry) => entry.id),
+    reasoning: candidates[0]?.notes ?? ["Used deterministic fallback ordering."],
+    confidence: 0.74,
+  });
+}
+
+function buildFallbackWardrobeExtraction(fileName: string) {
+  const guess = guessCategory(fileName);
+  return garmentExtractionSchema.parse({
+    garments: [
+      {
+        label: guess.label,
+        category: guess.category,
+        subcategory: guess.subcategory,
+        colors: ["neutral"],
+        pattern: "solid",
+        fabric: "unknown",
+        size: "",
+        size_source: "unknown",
+        formality: "casual",
+        seasonality: ["spring", "fall"],
+        layer_role: guess.layerRole,
+        occasion_tags: ["everyday"],
+        style_tags: ["clean"],
+        confidence: {
+          category: 0.56,
+          segmentation: 0.48,
+        },
+        box_2d: [0, 0, 1000, 1000],
+        mask: "",
+      },
+    ],
+  });
+}
+
+function pickSearchQuery(message: string) {
+  const cleaned = message
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const stripped = cleaned
+    .replace(/\b(remix|show|find|search|for|my|the|a|an|today|look|outfit|wear|create|me)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return stripped || cleaned || "wardrobe";
+}
+
+async function runFallbackStylistAssistant(params: {
+  message: string;
+  toolHandlers: Record<string, ToolHandler>;
+}) {
+  const message = params.message.toLowerCase();
+  const toolCalls: ToolCallRecord[] = [];
+
+  const callTool = async (name: string, args: Record<string, unknown>) => {
+    const handler = params.toolHandlers[name];
+    const result = handler
+      ? await handler(args)
+      : {
+          error: `No tool handler registered for ${name}`,
+        };
+    const record = { name, args, result } satisfies ToolCallRecord;
+    toolCalls.push(record);
+    return record;
+  };
+
+  if (message.includes("style")) {
+    return {
+      reply:
+        "Your wardrobe reads polished, neutral, and layered. You lean toward clean combinations that feel sharp without looking overworked.",
+      toolCalls,
+      promptVersion: "fallback",
+      model: "fallback",
+    };
+  }
+
+  if (
+    message.includes("outfit") ||
+    message.includes("wear") ||
+    message.includes("look") ||
+    message.includes("streetwear") ||
+    message.includes("date") ||
+    message.includes("cozy")
+  ) {
+    const weatherRecord = await callTool("getWeatherContext", {});
+    const outfitRecord = await callTool("generateOutfit", {
+      vibePrompt: params.message,
+    });
+
+    const weather =
+      typeof weatherRecord.result === "object" && weatherRecord.result && "weather" in weatherRecord.result
+        ? (weatherRecord.result.weather as Partial<WeatherSnapshot>)
+        : null;
+    const outfit =
+      typeof outfitRecord.result === "object" && outfitRecord.result && "primaryItems" in outfitRecord.result
+        ? (outfitRecord.result.primaryItems as Array<{ name?: string }>)
+        : [];
+    const itemNames = outfit.map((item) => item.name).filter(Boolean);
+
+    return {
+      reply:
+        itemNames.length > 0
+          ? `For ${weather?.conditionCode ?? "today’s weather"}, I’d go with ${itemNames.join(", ")}.`
+          : `I pulled together a weather-aware outfit for ${weather?.conditionCode ?? "today"}.`,
+      toolCalls,
+      promptVersion: "fallback",
+      model: "fallback",
+    };
+  }
+
+  if (message.includes("prefer") || message.includes("like") || message.includes("avoid")) {
+    const saved = await callTool("savePreference", {
+      preference: params.message,
+    });
+
+    return {
+      reply:
+        typeof saved.result === "object" && saved.result && "saved" in saved.result
+          ? "Saved that preference. I’ll factor it into future suggestions."
+          : "I noted that preference for future suggestions.",
+      toolCalls,
+      promptVersion: "fallback",
+      model: "fallback",
+    };
+  }
+
+  const search = await callTool("searchWardrobe", {
+    query: pickSearchQuery(params.message),
+  });
+  const matches =
+    typeof search.result === "object" && search.result && "matches" in search.result
+      ? (search.result.matches as Array<{ name?: string; category?: string }>)
+      : [];
+
+  return {
+    reply:
+      matches.length > 0
+        ? `I found ${matches
+            .slice(0, 3)
+            .map((item) => item.name ?? item.category ?? "a wardrobe item")
+            .join(", ")} in your wardrobe.`
+        : "I couldn’t find a clear wardrobe match, but I can help if you ask for a specific vibe, event, or item.",
+    toolCalls,
+    promptVersion: "fallback",
+    model: "fallback",
+  };
+}
+
 export async function extractWardrobeGarments(params: {
   buffer: Buffer;
   mimeType: string;
@@ -144,48 +318,27 @@ export async function extractWardrobeGarments(params: {
   const gemini = getGeminiClient();
 
   if (!gemini) {
-    const guess = guessCategory(params.fileName);
-    return garmentExtractionSchema.parse({
-      garments: [
+    return buildFallbackWardrobeExtraction(params.fileName);
+  }
+
+  try {
+    return await generateStructured({
+      schema: garmentExtractionSchema,
+      contents: [
         {
-          label: guess.label,
-          category: guess.category,
-          subcategory: guess.subcategory,
-          colors: ["neutral"],
-          pattern: "solid",
-          fabric: "unknown",
-          size: "",
-          size_source: "unknown",
-          formality: "casual",
-          seasonality: ["spring", "fall"],
-          layer_role: guess.layerRole,
-          occasion_tags: ["everyday"],
-          style_tags: ["clean"],
-          confidence: {
-            category: 0.56,
-            segmentation: 0.48,
+          inlineData: {
+            mimeType: params.mimeType,
+            data: params.buffer.toString("base64"),
           },
-          box_2d: [0, 0, 1000, 1000],
-          mask: "",
+        },
+        {
+          text: prompt,
         },
       ],
     });
+  } catch {
+    return buildFallbackWardrobeExtraction(params.fileName);
   }
-
-  return generateStructured({
-    schema: garmentExtractionSchema,
-    contents: [
-      {
-        inlineData: {
-          mimeType: params.mimeType,
-          data: params.buffer.toString("base64"),
-        },
-      },
-      {
-        text: prompt,
-      },
-    ],
-  });
 }
 
 export async function summarizeStylePreferences(params: {
@@ -204,25 +357,13 @@ export async function summarizeStylePreferences(params: {
     .join("\n");
 
   if (!getGeminiClient()) {
-    return styleSummarySchema.parse({
-      summary: params.freeformPreferences,
-      preferred_colors: params.explicitLikes?.filter((entry) => entry.length < 20) ?? [
-        "navy",
-        "white",
-        "charcoal",
-      ],
-      avoided_colors: params.explicitDislikes ?? [],
-      preferred_silhouettes: ["tailored", "easy layer"],
-      favorite_categories: ["shirt", "trousers", "outerwear"],
-      target_vibes: ["confident", "clean"],
-      formality_tendency: "balanced",
-      notes: ["Fallback summary used because Gemini is not configured."],
-    });
+    return buildFallbackStyleSummary(params);
   }
 
-  return generateStructured({
-    schema: styleSummarySchema,
-    contents: `
+  try {
+    return await generateStructured({
+      schema: styleSummarySchema,
+      contents: `
 Summarize these wardrobe preferences into structured traits for a stylist app.
 
 Return JSON only.
@@ -240,7 +381,10 @@ Use this exact shape:
 
 ${joinedText}
     `.trim(),
-  });
+    });
+  } catch {
+    return buildFallbackStyleSummary(params);
+  }
 }
 
 export async function embedStyleText(input: string) {
@@ -250,17 +394,21 @@ export async function embedStyleText(input: string) {
     return hashToVector(input, 16);
   }
 
-  const response = await gemini.models.embedContent({
-    model: "gemini-embedding-001",
-    contents: input,
-    config: {
-      outputDimensionality: 768,
-    },
-  });
+  try {
+    const response = await gemini.models.embedContent({
+      model: "gemini-embedding-001",
+      contents: input,
+      config: {
+        outputDimensionality: 768,
+      },
+    });
 
-  const embeddings = response.embeddings as Array<{ values?: number[] }>;
+    const embeddings = response.embeddings as Array<{ values?: number[] }>;
 
-  return embeddings[0]?.values ?? hashToVector(input, 16);
+    return embeddings[0]?.values ?? hashToVector(input, 16);
+  } catch {
+    return hashToVector(input, 16);
+  }
 }
 
 export async function rerankOutfitsWithGemini(params: {
@@ -271,29 +419,147 @@ export async function rerankOutfitsWithGemini(params: {
   vibePrompt?: string;
 }) {
   if (!getGeminiClient()) {
-    return outfitRankingSchema.parse({
-      primary_candidate_id: params.candidates[0]?.id ?? "",
-      alternate_candidate_ids: params.candidates.slice(1, 3).map((entry) => entry.id),
-      reasoning: params.candidates[0]?.notes ?? ["Used deterministic fallback ordering."],
-      confidence: 0.74,
-    });
+    return buildFallbackOutfitRanking(params.candidates);
   }
 
   const itemMap = new Map(params.wardrobeItems.map((item) => [item.id, item]));
 
-  return generateStructured({
-    schema: outfitRankingSchema,
-    contents: buildOutfitPrompt({
-      weather: params.weather,
-      styleProfile: params.styleProfile,
-      candidates: params.candidates,
-      itemMap,
-      vibePrompt: params.vibePrompt,
-    }),
-  });
+  try {
+    return await generateStructured({
+      schema: outfitRankingSchema,
+      contents: buildOutfitPrompt({
+        weather: params.weather,
+        styleProfile: params.styleProfile,
+        candidates: params.candidates,
+        itemMap,
+        vibePrompt: params.vibePrompt,
+      }),
+    });
+  } catch {
+    return buildFallbackOutfitRanking(params.candidates);
+  }
 }
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<unknown>;
+
+function extractFunctionCalls(response: {
+  functionCalls?: Array<{ name?: string; args?: Record<string, unknown> }>;
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        functionCall?: {
+          name?: string;
+          args?: Record<string, unknown>;
+        };
+      }>;
+    };
+  }>;
+}) {
+  const directCalls = (response.functionCalls ?? []).map((call) => ({
+    name: call.name,
+    args: call.args ?? {},
+  }));
+
+  if (directCalls.length > 0) {
+    return directCalls;
+  }
+
+  return (
+    response.candidates?.[0]?.content?.parts
+      ?.map((part) => part.functionCall)
+      .filter(Boolean)
+      .map((call) => ({
+        name: call?.name,
+        args: call?.args ?? {},
+      })) ?? []
+  );
+}
+
+function buildToolPrompt(params: {
+  history: Array<{ role: "user" | "assistant"; content: string }>;
+  message: string;
+  contextSummary: string;
+  toolCalls: ToolCallRecord[];
+}) {
+  return `
+Known context:
+${params.contextSummary}
+
+Conversation history:
+${params.history.map((entry) => `${entry.role}: ${entry.content}`).join("\n")}
+
+Latest user request:
+${params.message}
+
+Verified tool outputs:
+${JSON.stringify(params.toolCalls, null, 2)}
+
+Write a concise, helpful stylist reply for a phone screen.
+Use the verified tool outputs directly.
+Do not mention tool names.
+Do not invent clothes or facts that are not in the tool outputs.
+If the data is insufficient, say what is missing in one short sentence.
+  `.trim();
+}
+
+function synthesizeToolReply(toolCalls: ToolCallRecord[]) {
+  const generatedOutfit = toolCalls.find((record) => record.name === "generateOutfit");
+
+  if (
+    generatedOutfit &&
+    typeof generatedOutfit.result === "object" &&
+    generatedOutfit.result &&
+    "outfit" in generatedOutfit.result
+  ) {
+    return "I pulled together a fresh outfit from your wardrobe. If you want, I can refine it for a more formal, casual, or evening feel.";
+  }
+
+  const wardrobeSearch = toolCalls.find((record) => record.name === "searchWardrobe");
+
+  if (
+    wardrobeSearch &&
+    typeof wardrobeSearch.result === "object" &&
+    wardrobeSearch.result &&
+    "matches" in wardrobeSearch.result &&
+    Array.isArray(wardrobeSearch.result.matches)
+  ) {
+    const matches = wardrobeSearch.result.matches as Array<{ name?: string }>;
+
+    if (matches.length > 0) {
+      return `I found ${matches
+        .slice(0, 3)
+        .map((match) => match.name ?? "a wardrobe item")
+        .join(", ")} in your wardrobe.`;
+    }
+  }
+
+  const weatherCall = toolCalls.find((record) => record.name === "getWeatherContext");
+
+  if (
+    weatherCall &&
+    typeof weatherCall.result === "object" &&
+    weatherCall.result &&
+    "weather" in weatherCall.result &&
+    typeof weatherCall.result.weather === "object" &&
+    weatherCall.result.weather
+  ) {
+    const weather = weatherCall.result.weather as Partial<WeatherSnapshot>;
+    return `Today looks ${weather.conditionCode ?? "mixed"}, so I’d style around that weather first.`;
+  }
+
+  const savePreferenceCall = toolCalls.find((record) => record.name === "savePreference");
+
+  if (
+    savePreferenceCall &&
+    typeof savePreferenceCall.result === "object" &&
+    savePreferenceCall.result &&
+    "preference" in savePreferenceCall.result
+  ) {
+    return `Saved that preference, and I’ll use it in future outfit suggestions.`;
+  }
+
+  return "I’ve updated the stylist context from your wardrobe and saved data. Ask for a specific vibe, event, or item remix and I’ll narrow it down.";
+}
 
 export async function runStylistAssistant(params: {
   message: string;
@@ -304,13 +570,10 @@ export async function runStylistAssistant(params: {
   const gemini = getGeminiClient();
 
   if (!gemini) {
-    return {
-      reply:
-        "I can work from your saved wardrobe and feedback once Gemini is configured. For now, lean on your tailored layers and keep the palette neutral if you want a fast polished look.",
-      toolCalls: [] as ToolCallRecord[],
-      promptVersion: "fallback",
-      model: "fallback",
-    };
+    return runFallbackStylistAssistant({
+      message: params.message,
+      toolHandlers: params.toolHandlers,
+    });
   }
 
   const tools = [
@@ -385,76 +648,74 @@ export async function runStylistAssistant(params: {
     },
   ];
 
-  const initial = await gemini.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents,
-    config: {
-      systemInstruction: `${CHAT_SYSTEM_PROMPT}\n\nKnown context:\n${params.contextSummary}`,
-      tools: tools as never,
-    },
-  });
+  try {
+    const initial = await gemini.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents,
+      config: {
+        systemInstruction: `${CHAT_SYSTEM_PROMPT}\n\nKnown context:\n${params.contextSummary}`,
+        tools: tools as never,
+      },
+    });
 
-  const functionCalls = (initial.functionCalls ?? []) as Array<{
-    name?: string;
-    args?: Record<string, unknown>;
-  }>;
+    const functionCalls = extractFunctionCalls(initial);
 
-  if (!functionCalls.length) {
+    if (!functionCalls.length) {
+      return {
+        reply:
+          initial.text?.trim() ??
+          "I found a grounded wardrobe answer, but it came back empty.",
+        toolCalls: [] as ToolCallRecord[],
+        promptVersion: "luma-chat-v2",
+        model: "gemini-2.5-flash",
+      };
+    }
+
+    const executed: ToolCallRecord[] = [];
+
+    for (const call of functionCalls.slice(0, 4)) {
+      const name = call.name ?? "unknown";
+      const args = call.args ?? {};
+      const handler = params.toolHandlers[name];
+      const result = handler
+        ? await handler(args)
+        : {
+            error: `No tool handler registered for ${name}`,
+          };
+
+      executed.push({ name, args, result });
+    }
+
+    const final = await gemini.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: buildToolPrompt({
+        history: params.history.slice(-8),
+        message: params.message,
+        contextSummary: params.contextSummary,
+        toolCalls: executed,
+      }),
+      config: {
+        systemInstruction: `${CHAT_SYSTEM_PROMPT}\n\nKnown context:\n${params.contextSummary}`,
+      },
+    });
+
+    const reply =
+      final.text?.trim() ||
+      initial.text?.trim() ||
+      synthesizeToolReply(executed);
+
     return {
-      reply: initial.text ?? "I found a grounded wardrobe answer, but it came back empty.",
-      toolCalls: [] as ToolCallRecord[],
-      promptVersion: "luma-chat-v1",
+      reply,
+      toolCalls: executed,
+      promptVersion: "luma-chat-v2",
       model: "gemini-2.5-flash",
     };
+  } catch {
+    return runFallbackStylistAssistant({
+      message: params.message,
+      toolHandlers: params.toolHandlers,
+    });
   }
-
-  const executed: ToolCallRecord[] = [];
-
-  for (const call of functionCalls.slice(0, 4)) {
-    const name = call.name ?? "unknown";
-    const args = call.args ?? {};
-    const handler = params.toolHandlers[name];
-    const result = handler
-      ? await handler(args)
-      : {
-          error: `No tool handler registered for ${name}`,
-        };
-
-    executed.push({ name, args, result });
-  }
-
-  const final = await gemini.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: [
-      ...contents,
-      initial.candidates?.[0]?.content ?? {
-        role: "model",
-        parts: [{ text: initial.text }],
-      },
-      {
-        role: "user",
-        parts: executed.map((record) => ({
-          functionResponse: {
-            name: record.name,
-            response: {
-              output: record.result as Record<string, unknown>,
-            },
-          },
-        })),
-      },
-    ],
-    config: {
-      systemInstruction: `${CHAT_SYSTEM_PROMPT}\n\nKnown context:\n${params.contextSummary}`,
-      tools: tools as never,
-    },
-  });
-
-  return {
-    reply: final.text ?? initial.text ?? "I can help once the tool responses are available.",
-    toolCalls: executed,
-    promptVersion: "luma-chat-v1",
-    model: "gemini-2.5-flash",
-  };
 }
 
 export function buildItemName(label: string, colors: string[]) {

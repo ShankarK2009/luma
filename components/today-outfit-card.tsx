@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { RefreshCw, ThumbsDown, ThumbsUp } from "lucide-react";
 
 import type { OutfitSuggestion, WardrobeItem } from "@/lib/types";
@@ -19,6 +19,13 @@ function describeItem(itemId: string | undefined, itemsById: Record<string, Ward
   return itemsById[itemId] ?? null;
 }
 
+function buildSlotKey(outfit: OutfitSuggestion["primarySlots"]) {
+  return JSON.stringify({
+    ...outfit,
+    accessories: outfit.accessories?.slice().sort() ?? [],
+  });
+}
+
 export function TodayOutfitCard({
   outfit,
   itemsById,
@@ -28,6 +35,13 @@ export function TodayOutfitCard({
 }) {
   const [currentOutfit, setCurrentOutfit] = useState(outfit);
   const [status, setStatus] = useState<string | null>(null);
+  const [seenSlotKeys, setSeenSlotKeys] = useState<string[]>([buildSlotKey(outfit.primarySlots)]);
+
+  useEffect(() => {
+    setCurrentOutfit(outfit);
+    setSeenSlotKeys([buildSlotKey(outfit.primarySlots)]);
+    setStatus(null);
+  }, [outfit]);
 
   const primary = [
     describeItem(currentOutfit.primarySlots.top, itemsById),
@@ -59,6 +73,24 @@ export function TodayOutfitCard({
   };
 
   const regenerate = async () => {
+    const queuedAlternate = currentOutfit.alternateSlots.find(
+      (slots) => !seenSlotKeys.includes(buildSlotKey(slots)),
+    );
+
+    if (queuedAlternate) {
+      const nextKey = buildSlotKey(queuedAlternate);
+      setCurrentOutfit((previous) => ({
+        ...previous,
+        primarySlots: queuedAlternate,
+        alternateSlots: previous.alternateSlots.filter(
+          (slots) => buildSlotKey(slots) !== nextKey,
+        ),
+      }));
+      setSeenSlotKeys((current) => [...current, nextKey]);
+      setStatus("Showing another outfit from today's alternates.");
+      return;
+    }
+
     setStatus("Generating another outfit...");
 
     try {
@@ -67,7 +99,13 @@ export function TodayOutfitCard({
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          excludeSlotKeys: seenSlotKeys,
+          vibePrompt:
+            typeof currentOutfit.context.vibePrompt === "string"
+              ? currentOutfit.context.vibePrompt
+              : undefined,
+        }),
       });
 
       if (!response.ok) {
@@ -75,7 +113,11 @@ export function TodayOutfitCard({
       }
 
       const payload = (await response.json()) as { outfit: OutfitSuggestion };
+      const nextKey = buildSlotKey(payload.outfit.primarySlots);
       setCurrentOutfit(payload.outfit);
+      setSeenSlotKeys((current) =>
+        current.includes(nextKey) ? current : [...current, nextKey],
+      );
       setStatus("Fresh outfit generated.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not regenerate right now.");

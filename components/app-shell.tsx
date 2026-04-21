@@ -14,10 +14,7 @@ export function AppShell({
   subtitle: string;
 }) {
   return (
-    <div className="relative min-h-screen overflow-hidden">
-      <div className="pointer-events-none absolute inset-x-0 top-[-18rem] h-[28rem] rounded-full bg-[radial-gradient(circle,rgba(255,183,77,0.26),transparent_58%)] blur-3xl" />
-      <div className="pointer-events-none absolute right-[-10rem] top-32 h-72 w-72 rounded-full bg-[radial-gradient(circle,rgba(86,180,211,0.22),transparent_62%)] blur-3xl" />
-
+    <div className="relative min-h-screen">
       <div className="mx-auto flex min-h-screen max-w-md flex-col px-4 pb-28 pt-5">
         <header className="mb-5 flex items-center justify-between">
           <div>

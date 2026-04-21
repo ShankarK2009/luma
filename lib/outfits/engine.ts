@@ -6,7 +6,7 @@ import type {
 } from "@/lib/types";
 import { inferSlotFromItem, scoreItem } from "@/lib/outfits/rules";
 
-function uniqKey(slots: OutfitSlotMap) {
+export function buildOutfitSlotKey(slots: OutfitSlotMap) {
   return JSON.stringify({
     ...slots,
     accessories: slots.accessories?.slice().sort() ?? [],
@@ -63,7 +63,7 @@ export function buildDeterministicCandidates(
       shoes: ranked.shoes[0]?.id,
       accessories: ranked.accessories.slice(0, 2).map((item) => item.id),
     };
-    const key = uniqKey(slotsMap);
+    const key = buildOutfitSlotKey(slotsMap);
 
     if (!seen.has(key)) {
       seen.add(key);
@@ -98,7 +98,7 @@ export function buildDeterministicCandidates(
         shoes: shoes?.id,
         accessories: accessories.map((item) => item.id),
       };
-      const key = uniqKey(slotsMap);
+      const key = buildOutfitSlotKey(slotsMap);
 
       if (seen.has(key)) continue;
       seen.add(key);

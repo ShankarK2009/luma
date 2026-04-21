@@ -13,6 +13,7 @@ export async function POST(request: Request) {
       userId: user.userId,
       vibePrompt: payload.vibePrompt,
       date: payload.date,
+      excludeSlotKeys: payload.excludeSlotKeys,
     });
 
     return NextResponse.json(result);

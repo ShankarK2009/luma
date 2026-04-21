@@ -1,11 +1,13 @@
 import { getDemoState } from "@/lib/data/demo";
 import { hasSupabaseEnv } from "@/lib/env";
+import { inferSlotFromItem } from "@/lib/outfits/rules";
 import { getSupabaseAdminMaybe } from "@/lib/supabase/admin";
 import { getServerSupabaseClientMaybe } from "@/lib/supabase/server";
 import type {
   AiRun,
   FeedbackEvent,
   OutfitSuggestion,
+  OutfitSlotMap,
   ProcessingJob,
   StyleProfile,
   StylistMessage,
@@ -15,6 +17,7 @@ import type {
   WardrobeFilters,
   WardrobeItem,
 } from "@/lib/types";
+import { buildOutfitSlotKey } from "@/lib/outfits/engine";
 
 function matchesFilters(item: WardrobeItem, filters?: WardrobeFilters) {
   if (!filters) return true;
@@ -61,6 +64,18 @@ function throwIfSupabaseError(
   if (error) {
     throw new Error(`${context}: ${error.message ?? "Unknown Supabase error."}`);
   }
+}
+
+export function isTransientSupabaseFetchFailure(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("network") ||
+    message.includes("error code 521") ||
+    message.includes("web server is down") ||
+    message.includes("cloudflare")
+  );
 }
 
 function mapAsset(record: Record<string, unknown>): WardrobeAsset {
@@ -306,13 +321,20 @@ export async function getStyleProfile(userId: string) {
     return demo.styleProfile;
   }
 
-  const { data } = await client
-    .from("style_profiles")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle();
+  try {
+    const { data } = await client
+      .from("style_profiles")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
 
-  return data ? mapStyleProfile(data) : demo.styleProfile;
+    return data ? mapStyleProfile(data) : demo.styleProfile;
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      return demo.styleProfile;
+    }
+    throw error;
+  }
 }
 
 export async function upsertStyleProfile(userId: string, payload: StyleProfile) {
@@ -366,33 +388,130 @@ export async function getTodayOutfit(userId: string, date = new Date().toISOStri
     return demo.outfitSuggestions[0];
   }
 
-  const { data } = await client
+  let data:
+    | Array<Record<string, unknown>>
+    | null
+    | undefined;
+  try {
+    const response = await client
+      .from("outfit_suggestions")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("generated_for_date", date)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    data = response.data as Array<Record<string, unknown>> | null;
+    throwIfSupabaseError(response.error, "Could not load today's outfit");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      console.warn("Supabase fetch failed while loading today's outfit. Returning no saved outfit.", error);
+      return null;
+    }
+
+    throw error;
+  }
+
+  const record = data?.[0];
+
+  if (!record) {
+    return null;
+  }
+
+  return {
+    id: String(record.id),
+    userId: String(record.user_id),
+    generatedForDate: String(record.generated_for_date),
+    context: (record.context_json ?? {}) as Record<string, unknown>,
+    primarySlots: (record.primary_slots_json ?? {}) as OutfitSuggestion["primarySlots"],
+    alternateSlots: (record.alternate_slots_json ?? []) as OutfitSuggestion["alternateSlots"],
+    reasoning: Array.isArray(record.reasoning_json)
+      ? (record.reasoning_json as string[])
+      : [],
+    confidence: Number(record.confidence ?? 0),
+    acceptedAt: record.accepted_at ? String(record.accepted_at) : null,
+    rejectedAt: record.rejected_at ? String(record.rejected_at) : null,
+    createdAt: String(record.created_at),
+  } satisfies OutfitSuggestion;
+}
+
+export async function listOutfitSuggestionsForDate(
+  userId: string,
+  date = new Date().toISOString().slice(0, 10),
+  limit = 12,
+) {
+  const demo = getDemoState();
+
+  if (!hasSupabaseEnv) {
+    return demo.outfitSuggestions
+      .filter((outfit) => outfit.userId === userId && outfit.generatedForDate === date)
+      .slice(0, limit);
+  }
+
+  const client = await getSupabaseClient();
+
+  if (!client) {
+    return demo.outfitSuggestions
+      .filter((outfit) => outfit.userId === userId && outfit.generatedForDate === date)
+      .slice(0, limit);
+  }
+
+  const { data, error } = await client
     .from("outfit_suggestions")
     .select("*")
     .eq("user_id", userId)
     .eq("generated_for_date", date)
     .order("created_at", { ascending: false })
-    .maybeSingle();
+    .limit(limit);
 
-  if (!data) {
-    return null;
-  }
+  throwIfSupabaseError(error, "Could not load outfit history");
+
+  return (data ?? []).map(
+    (record) =>
+      ({
+        id: String(record.id),
+        userId: String(record.user_id),
+        generatedForDate: String(record.generated_for_date),
+        context: (record.context_json ?? {}) as Record<string, unknown>,
+        primarySlots: (record.primary_slots_json ?? {}) as OutfitSuggestion["primarySlots"],
+        alternateSlots: (record.alternate_slots_json ?? []) as OutfitSuggestion["alternateSlots"],
+        reasoning: Array.isArray(record.reasoning_json)
+          ? (record.reasoning_json as string[])
+          : [],
+        confidence: Number(record.confidence ?? 0),
+        acceptedAt: record.accepted_at ? String(record.accepted_at) : null,
+        rejectedAt: record.rejected_at ? String(record.rejected_at) : null,
+        createdAt: String(record.created_at),
+      }) satisfies OutfitSuggestion,
+  );
+}
+
+export function canGenerateOutfitFromItems(items: WardrobeItem[]) {
+  const active = items.filter((item) => item.status !== "archived");
+  const slots = new Set(
+    active
+      .map((item) => inferSlotFromItem(item))
+      .filter((slot): slot is NonNullable<ReturnType<typeof inferSlotFromItem>> => slot !== null),
+  );
+  const hasTop = slots.has("top");
+  const hasBottom = slots.has("bottom");
+  const hasOnePiece = slots.has("onePiece");
+  const hasShoes = slots.has("shoes");
 
   return {
-    id: String(data.id),
-    userId: String(data.user_id),
-    generatedForDate: String(data.generated_for_date),
-    context: (data.context_json ?? {}) as Record<string, unknown>,
-    primarySlots: (data.primary_slots_json ?? {}) as OutfitSuggestion["primarySlots"],
-    alternateSlots: (data.alternate_slots_json ?? []) as OutfitSuggestion["alternateSlots"],
-    reasoning: Array.isArray(data.reasoning_json)
-      ? (data.reasoning_json as string[])
-      : [],
-    confidence: Number(data.confidence ?? 0),
-    acceptedAt: data.accepted_at ? String(data.accepted_at) : null,
-    rejectedAt: data.rejected_at ? String(data.rejected_at) : null,
-    createdAt: String(data.created_at),
-  } satisfies OutfitSuggestion;
+    canGenerate: hasShoes && ((hasTop && hasBottom) || hasOnePiece),
+    needs: {
+      top: hasTop,
+      bottom: hasBottom,
+      onePiece: hasOnePiece,
+      shoes: hasShoes,
+    },
+  };
+}
+
+export function buildSuggestionExclusionKeys(
+  suggestions: Array<{ primarySlots: OutfitSlotMap }>,
+) {
+  return suggestions.map((suggestion) => buildOutfitSlotKey(suggestion.primarySlots));
 }
 
 export async function saveOutfitSuggestion(outfit: OutfitSuggestion) {
@@ -512,21 +631,30 @@ export async function createProcessingJob(job: ProcessingJob) {
     return job;
   }
 
-  const { error } = await client.from("processing_jobs").insert({
-    id: job.id,
-    user_id: job.userId,
-    status: job.status,
-    capture_mode: job.captureMode,
-    file_name: job.fileName,
-    mime_type: job.mimeType,
-    source_path: job.sourcePath,
-    result_item_ids: job.resultItemIds,
-    error_message: job.errorMessage,
-    created_at: job.createdAt,
-    updated_at: job.updatedAt,
-  });
+  try {
+    const { error } = await client.from("processing_jobs").insert({
+      id: job.id,
+      user_id: job.userId,
+      status: job.status,
+      capture_mode: job.captureMode,
+      file_name: job.fileName,
+      mime_type: job.mimeType,
+      source_path: job.sourcePath,
+      result_item_ids: job.resultItemIds,
+      error_message: job.errorMessage,
+      created_at: job.createdAt,
+      updated_at: job.updatedAt,
+    });
 
-  throwIfSupabaseError(error, "Could not create the processing job");
+    throwIfSupabaseError(error, "Could not create the processing job");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      demo.processingJobs.unshift(job);
+      return job;
+    }
+
+    throw error;
+  }
 
   return job;
 }
@@ -589,17 +717,28 @@ export async function updateProcessingJob(jobId: string, patch: Partial<Processi
     return demoJob ?? null;
   }
 
-  const { error } = await client
-    .from("processing_jobs")
-    .update({
-      ...(patch.status ? { status: patch.status } : {}),
-      ...(patch.resultItemIds ? { result_item_ids: patch.resultItemIds } : {}),
-      ...(patch.errorMessage !== undefined ? { error_message: patch.errorMessage } : {}),
-      updated_at: patch.updatedAt ?? new Date().toISOString(),
-    })
-    .eq("id", jobId);
+  try {
+    const { error } = await client
+      .from("processing_jobs")
+      .update({
+        ...(patch.status ? { status: patch.status } : {}),
+        ...(patch.resultItemIds ? { result_item_ids: patch.resultItemIds } : {}),
+        ...(patch.errorMessage !== undefined ? { error_message: patch.errorMessage } : {}),
+        updated_at: patch.updatedAt ?? new Date().toISOString(),
+      })
+      .eq("id", jobId);
 
-  throwIfSupabaseError(error, "Could not update the processing job");
+    throwIfSupabaseError(error, "Could not update the processing job");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      if (demoJob) {
+        Object.assign(demoJob, patch);
+      }
+      return demoJob ?? null;
+    }
+
+    throw error;
+  }
 
   return getProcessingJob(patch.userId ?? demo.user.id, jobId);
 }
@@ -624,45 +763,55 @@ export async function insertProcessedWardrobeItem(params: {
     return params.item;
   }
 
-  const { error: itemError } = await client.from("wardrobe_items").insert({
-    id: params.item.id,
-    user_id: params.item.userId,
-    status: params.item.status,
-    name: params.item.name,
-    category: params.item.category,
-    subcategory: params.item.subcategory,
-    colors_json: params.item.colors,
-    pattern: params.item.pattern,
-    fabric: params.item.fabric,
-    size: params.item.size,
-    formality: params.item.formality,
-    seasonality_json: params.item.seasonality,
-    layer_role: params.item.layerRole,
-    occasion_tags_json: params.item.occasionTags,
-    style_tags_json: params.item.styleTags,
-    wear_count: params.item.wearCount,
-    last_worn_at: params.item.lastWornAt,
-    favorite_score: params.item.favoriteScore,
-    dislike_score: params.item.dislikeScore,
-    confidence_json: params.item.confidence,
-    source_prompt_version: params.item.sourcePromptVersion,
-    created_at: params.item.createdAt,
-  });
+  try {
+    const { error: itemError } = await client.from("wardrobe_items").insert({
+      id: params.item.id,
+      user_id: params.item.userId,
+      status: params.item.status,
+      name: params.item.name,
+      category: params.item.category,
+      subcategory: params.item.subcategory,
+      colors_json: params.item.colors,
+      pattern: params.item.pattern,
+      fabric: params.item.fabric,
+      size: params.item.size,
+      formality: params.item.formality,
+      seasonality_json: params.item.seasonality,
+      layer_role: params.item.layerRole,
+      occasion_tags_json: params.item.occasionTags,
+      style_tags_json: params.item.styleTags,
+      wear_count: params.item.wearCount,
+      last_worn_at: params.item.lastWornAt,
+      favorite_score: params.item.favoriteScore,
+      dislike_score: params.item.dislikeScore,
+      confidence_json: params.item.confidence,
+      source_prompt_version: params.item.sourcePromptVersion,
+      created_at: params.item.createdAt,
+    });
 
-  throwIfSupabaseError(itemError, "Could not save the wardrobe item");
+    throwIfSupabaseError(itemError, "Could not save the wardrobe item");
 
-  const { error: assetError } = await client.from("wardrobe_assets").insert({
-    id: params.asset.id,
-    item_id: params.asset.itemId,
-    original_path: params.asset.originalPath,
-    cropped_path: params.asset.croppedPath,
-    isolated_path: params.asset.isolatedPath,
-    mask_path: params.asset.maskPath,
-    bbox_json: params.asset.bbox,
-    quality_flags_json: params.asset.qualityFlags,
-  });
+    const { error: assetError } = await client.from("wardrobe_assets").insert({
+      id: params.asset.id,
+      item_id: params.asset.itemId,
+      original_path: params.asset.originalPath,
+      cropped_path: params.asset.croppedPath,
+      isolated_path: params.asset.isolatedPath,
+      mask_path: params.asset.maskPath,
+      bbox_json: params.asset.bbox,
+      quality_flags_json: params.asset.qualityFlags,
+    });
 
-  throwIfSupabaseError(assetError, "Could not save the wardrobe asset");
+    throwIfSupabaseError(assetError, "Could not save the wardrobe asset");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      demo.wardrobeItems.unshift(params.item);
+      demo.wardrobeAssets.unshift(params.asset);
+      return params.item;
+    }
+
+    throw error;
+  }
 
   return params.item;
 }
@@ -760,83 +909,93 @@ export async function getOrCreateStylistThread(userId: string, threadId?: string
     return demo.stylistThreads[0];
   }
 
-  if (threadId) {
-    const { data } = await client
-      .from("stylist_threads")
-      .select("*")
-      .eq("id", threadId)
-      .eq("user_id", userId)
+  try {
+    if (threadId) {
+      const { data } = await client
+        .from("stylist_threads")
+        .select("*")
+        .eq("id", threadId)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (data) {
+        return {
+          id: String(data.id),
+          userId: String(data.user_id),
+          title: String(data.title ?? "Stylist"),
+          createdAt: String(data.created_at),
+        } satisfies StylistThread;
+      }
+    }
+
+    const { data: latestMessage } = await client
+      .from("stylist_messages")
+      .select("thread_id, created_at")
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
 
-    if (data) {
-      return {
-        id: String(data.id),
-        userId: String(data.user_id),
-        title: String(data.title ?? "Stylist"),
-        createdAt: String(data.created_at),
-      } satisfies StylistThread;
+    if (latestMessage?.thread_id) {
+      const { data: activeThread } = await client
+        .from("stylist_threads")
+        .select("*")
+        .eq("id", String(latestMessage.thread_id))
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (activeThread) {
+        return {
+          id: String(activeThread.id),
+          userId: String(activeThread.user_id),
+          title: String(activeThread.title ?? "Stylist"),
+          createdAt: String(activeThread.created_at),
+        } satisfies StylistThread;
+      }
     }
-  }
 
-  const { data: latestMessage } = await client
-    .from("stylist_messages")
-    .select("thread_id, created_at")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (latestMessage?.thread_id) {
-    const { data: activeThread } = await client
+    const { data: latest } = await client
       .from("stylist_threads")
       .select("*")
-      .eq("id", String(latestMessage.thread_id))
       .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
       .maybeSingle();
 
-    if (activeThread) {
+    if (latest) {
       return {
-        id: String(activeThread.id),
-        userId: String(activeThread.user_id),
-        title: String(activeThread.title ?? "Stylist"),
-        createdAt: String(activeThread.created_at),
+        id: String(latest.id),
+        userId: String(latest.user_id),
+        title: String(latest.title ?? "Stylist"),
+        createdAt: String(latest.created_at),
       } satisfies StylistThread;
     }
-  }
 
-  const { data: latest } = await client
-    .from("stylist_threads")
-    .select("*")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (latest) {
-    return {
-      id: String(latest.id),
-      userId: String(latest.user_id),
-      title: String(latest.title ?? "Stylist"),
-      createdAt: String(latest.created_at),
+    const created = {
+      id: crypto.randomUUID(),
+      userId,
+      title: "Daily stylist",
+      createdAt: new Date().toISOString(),
     } satisfies StylistThread;
+
+    const { error } = await client.from("stylist_threads").insert({
+      id: created.id,
+      user_id: created.userId,
+      title: created.title,
+      created_at: created.createdAt,
+    });
+
+    throwIfSupabaseError(error, "Could not create the stylist thread");
+
+    return created;
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      if (threadId) {
+        return demo.stylistThreads.find((thread) => thread.id === threadId) ?? demo.stylistThreads[0];
+      }
+      return demo.stylistThreads[0];
+    }
+    throw error;
   }
-
-  const created = {
-    id: crypto.randomUUID(),
-    userId,
-    title: "Daily stylist",
-    createdAt: new Date().toISOString(),
-  } satisfies StylistThread;
-
-  const { error } = await client.from("stylist_threads").insert({
-    id: created.id,
-    user_id: created.userId,
-    title: created.title,
-    created_at: created.createdAt,
-  });
-
-  throwIfSupabaseError(error, "Could not create the stylist thread");
-
-  return created;
 }
 
 export async function listStylistMessages(threadId: string) {
@@ -852,25 +1011,32 @@ export async function listStylistMessages(threadId: string) {
     return demo.stylistMessages.filter((message) => message.threadId === threadId);
   }
 
-  const { data } = await client
-    .from("stylist_messages")
-    .select("*")
-    .eq("thread_id", threadId)
-    .order("created_at", { ascending: true });
+  try {
+    const { data } = await client
+      .from("stylist_messages")
+      .select("*")
+      .eq("thread_id", threadId)
+      .order("created_at", { ascending: true });
 
-  return (data ?? []).map(
-    (record) =>
-      ({
-        id: String(record.id),
-        threadId: String(record.thread_id),
-        role: String(record.role) as StylistMessage["role"],
-        content: String(record.content ?? ""),
-        toolCalls: Array.isArray(record.tool_calls_json)
-          ? (record.tool_calls_json as StylistMessage["toolCalls"])
-          : [],
-        createdAt: String(record.created_at),
-      }) satisfies StylistMessage,
-  );
+    return (data ?? []).map(
+      (record) =>
+        ({
+          id: String(record.id),
+          threadId: String(record.thread_id),
+          role: String(record.role) as StylistMessage["role"],
+          content: String(record.content ?? ""),
+          toolCalls: Array.isArray(record.tool_calls_json)
+            ? (record.tool_calls_json as StylistMessage["toolCalls"])
+            : [],
+          createdAt: String(record.created_at),
+        }) satisfies StylistMessage,
+    );
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      return demo.stylistMessages.filter((message) => message.threadId === threadId);
+    }
+    throw error;
+  }
 }
 
 export async function appendStylistMessage(message: StylistMessage) {
@@ -888,16 +1054,24 @@ export async function appendStylistMessage(message: StylistMessage) {
     return message;
   }
 
-  const { error } = await client.from("stylist_messages").insert({
-    id: message.id,
-    thread_id: message.threadId,
-    role: message.role,
-    content: message.content,
-    tool_calls_json: message.toolCalls,
-    created_at: message.createdAt,
-  });
+  try {
+    const { error } = await client.from("stylist_messages").insert({
+      id: message.id,
+      thread_id: message.threadId,
+      role: message.role,
+      content: message.content,
+      tool_calls_json: message.toolCalls,
+      created_at: message.createdAt,
+    });
 
-  throwIfSupabaseError(error, "Could not append the stylist message");
+    throwIfSupabaseError(error, "Could not append the stylist message");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      demo.stylistMessages.push(message);
+      return message;
+    }
+    throw error;
+  }
 
   return message;
 }
@@ -917,21 +1091,30 @@ export async function saveAiRun(run: AiRun) {
     return run;
   }
 
-  const { error } = await client.from("ai_runs").insert({
-    id: run.id,
-    user_id: run.userId,
-    run_type: run.runType,
-    model: run.model,
-    prompt_version: run.promptVersion,
-    input_json: run.input,
-    output_json: run.output,
-    latency_ms: run.latencyMs,
-    token_usage_json: run.tokenUsage,
-    status: run.status,
-    created_at: run.createdAt,
-  });
+  try {
+    const { error } = await client.from("ai_runs").insert({
+      id: run.id,
+      user_id: run.userId,
+      run_type: run.runType,
+      model: run.model,
+      prompt_version: run.promptVersion,
+      input_json: run.input,
+      output_json: run.output,
+      latency_ms: run.latencyMs,
+      token_usage_json: run.tokenUsage,
+      status: run.status,
+      created_at: run.createdAt,
+    });
 
-  throwIfSupabaseError(error, "Could not save the AI run");
+    throwIfSupabaseError(error, "Could not save the AI run");
+  } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      demo.aiRuns.unshift(run);
+      return run;
+    }
+
+    throw error;
+  }
 
   return run;
 }

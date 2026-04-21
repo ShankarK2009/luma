@@ -23,15 +23,15 @@
   box-sizing: border-box;
 }
 
-html {
-  background:
-    radial-gradient(circle at top, rgba(243, 179, 76, 0.1), transparent 34%),
-    linear-gradient(180deg, #0b141b 0%, #091117 45%, #071016 100%);
+html,
+body {
+  min-height: 100%;
+  width: 100%;
+  overflow-x: hidden;
 }
 
 body {
-  min-height: 100vh;
-  background: transparent;
+  background: var(--canvas);
   color: var(--text-strong);
   font-family: var(--font-space-grotesk), sans-serif;
 }

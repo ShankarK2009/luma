@@ -1,10 +1,11 @@
 import { getDemoState } from "@/lib/data/demo";
-import { ensureUserProfileRecord } from "@/lib/data/repository";
+import { ensureUserProfileRecord, isTransientSupabaseFetchFailure } from "@/lib/data/repository";
 import { hasSupabaseAdminEnv, hasSupabaseEnv } from "@/lib/env";
 import { getServerSupabaseClientMaybe } from "@/lib/supabase/server";
 import type { UserContext } from "@/lib/types";
 
 const OWNER_USER_ID = "11111111-1111-4111-8111-111111111111";
+let hasLoggedSupabaseProfileUnavailable = false;
 
 export class AuthRequiredError extends Error {
   status = 401;
@@ -22,6 +23,13 @@ async function safelyEnsureUserProfile(params: {
   try {
     await ensureUserProfileRecord(params);
   } catch (error) {
+    if (isTransientSupabaseFetchFailure(error)) {
+      if (!hasLoggedSupabaseProfileUnavailable) {
+        console.warn("Supabase unavailable while ensuring user profile record.");
+        hasLoggedSupabaseProfileUnavailable = true;
+      }
+      return;
+    }
     console.error("Failed to ensure Supabase user profile record.", error);
   }
 }
